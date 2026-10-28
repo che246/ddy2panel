@@ -10,6 +10,7 @@ on:
     tags: ["v*"]
     paths-ignore:
       - ".github/workflows/autobot.yml"
+      - ".github/workflows/sync-upstream.yml"
       - "AutoBot.yml"
       - "scripts/autobot.py"
   pull_request:

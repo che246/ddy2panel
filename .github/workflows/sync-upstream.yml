@@ -1,0 +1,119 @@
+name: sync-upstream
+
+on:
+  schedule:
+    # 每小时整点检测一次 (UTC 00:00, 01:00, ... 对应上海时间 08:00, 09:00, ...)
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        description: "是否强制编译并发布 Release（即使上游无新提交）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  check-and-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Check upstream updates
+        id: check
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/misakano7545/workbuddy2api-panel.git || git remote set-url upstream https://github.com/misakano7545/workbuddy2api-panel.git
+          git fetch upstream main
+
+          LOCAL_HASH=$(git rev-parse HEAD)
+          UPSTREAM_HASH=$(git rev-parse upstream/main)
+          NEW_COMMITS=$(git rev-list --count HEAD..upstream/main)
+
+          echo "Local HEAD: $LOCAL_HASH"
+          echo "Upstream main: $UPSTREAM_HASH"
+          echo "New commits count: $NEW_COMMITS"
+
+          if [ "$NEW_COMMITS" -gt 0 ] || [ "${{ github.event.inputs.force_sync }}" = "true" ]; then
+            echo "has_update=true" >> "$GITHUB_OUTPUT"
+            echo "new_commits=$NEW_COMMITS" >> "$GITHUB_OUTPUT"
+            echo "upstream_hash=$UPSTREAM_HASH" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+            echo "上游没有新提交，无需同步与发版。"
+          fi
+
+      - name: Merge upstream & Tag version
+        if: steps.check.outputs.has_update == 'true'
+        id: versioning
+        run: |
+          NEW_COMMITS="${{ steps.check.outputs.new_commits }}"
+          UPSTREAM_HASH="${{ steps.check.outputs.upstream_hash }}"
+
+          if [ "$NEW_COMMITS" -gt 0 ]; then
+            echo "正在合并上游更新..."
+            git merge upstream/main --no-edit -m "chore(sync): sync upstream/main (${UPSTREAM_HASH:0:7})"
+          fi
+
+          # 计算上海时间版本号（遵循 AGENTS.md 规范）
+          VERSION=$(TZ=Asia/Shanghai date +%Y.%-m.%-d.%-H%M)
+          [ "$(TZ=UTC date +%H)" = "$(TZ=Asia/Shanghai date +%H)" ] && VERSION=$(date -u -d '+8 hours' +%Y.%-m.%-d.%-H%M)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Release Version: v$VERSION"
+
+          git tag "v${VERSION}"
+          git push origin main
+          git push origin "v${VERSION}"
+
+      - name: Setup Go
+        if: steps.check.outputs.has_update == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        if: steps.check.outputs.has_update == 'true'
+        run: go test ./...
+
+      - name: Build cross-platform binaries
+        if: steps.check.outputs.has_update == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          pack() {
+            dir="dist/$1-$2"
+            mkdir -p "$dir"
+            cp "$3" "$dir/"
+            cp config.example.json README.md "$dir/"
+            python3 -c 'import os,sys,zipfile; n,d=sys.argv[1:]; z=zipfile.ZipFile(n,"w",zipfile.ZIP_DEFLATED); [z.write(os.path.join(d,f), f) for f in os.listdir(d)]; z.close()' \
+              "dist/wb2api-panel-${VERSION}-$1-$2.zip" "$dir"
+          }
+          for os in windows linux darwin; do
+            bin=wb2api
+            [ "$os" = windows ] && bin=wb2api.exe
+            for arch in amd64 arm64; do
+              CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+                go build -trimpath -ldflags="-s -w -X main.appVersion=${VERSION}" -o "$bin" ./cmd/server
+              pack "$os" "$arch" "$bin"
+            done
+          done
+
+      - name: Release to GitHub Releases
+        if: steps.check.outputs.has_update == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${VERSION}" dist/*.zip \
+            --title "v${VERSION}" \
+            --generate-notes
