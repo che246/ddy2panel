@@ -30,9 +30,15 @@ jobs:
 
       - name: Check upstream updates
         id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 确保 gh 默认仓库指向本仓库（避免多 remote 干扰）
+          gh repo set-default "$GITHUB_REPOSITORY" 2>/dev/null || true
 
           git remote add upstream https://github.com/misakano7545/workbuddy2api-panel.git || git remote set-url upstream https://github.com/misakano7545/workbuddy2api-panel.git
           git fetch upstream main
@@ -45,13 +51,17 @@ jobs:
           echo "Upstream main: $UPSTREAM_HASH"
           echo "New commits count: $NEW_COMMITS"
 
-          if [ "$NEW_COMMITS" -gt 0 ] || [ "${{ github.event.inputs.force_sync }}" = "true" ]; then
+          # 检查本仓库是否已有 Release
+          LATEST_RELEASE=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName 2>/dev/null || echo "")
+          echo "Current latest release in repository: $LATEST_RELEASE"
+
+          if [ "$NEW_COMMITS" -gt 0 ] || [ -z "$LATEST_RELEASE" ] || [ "${{ github.event.inputs.force_sync }}" = "true" ]; then
             echo "has_update=true" >> "$GITHUB_OUTPUT"
             echo "new_commits=$NEW_COMMITS" >> "$GITHUB_OUTPUT"
             echo "upstream_hash=$UPSTREAM_HASH" >> "$GITHUB_OUTPUT"
           else
             echo "has_update=false" >> "$GITHUB_OUTPUT"
-            echo "上游没有新提交，无需同步与发版。"
+            echo "上游没有新提交，且已有最新 Release，无需同步与发版。"
           fi
 
       - name: Merge upstream & Tag version
@@ -66,15 +76,18 @@ jobs:
             git merge upstream/main --no-edit -m "chore(sync): sync upstream/main (${UPSTREAM_HASH:0:7})"
           fi
 
+          # 合并完成后移除 upstream remote，彻底消除 gh 工具的默认仓库判定歧义
+          git remote remove upstream || true
+
           # 计算上海时间版本号（遵循 AGENTS.md 规范）
           VERSION=$(TZ=Asia/Shanghai date +%Y.%-m.%-d.%-H%M)
           [ "$(TZ=UTC date +%H)" = "$(TZ=Asia/Shanghai date +%H)" ] && VERSION=$(date -u -d '+8 hours' +%Y.%-m.%-d.%-H%M)
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "Release Version: v$VERSION"
 
-          git tag "v${VERSION}"
+          git tag -f "v${VERSION}"
           git push origin main
-          git push origin "v${VERSION}"
+          git push origin "v${VERSION}" --force
 
       - name: Setup Go
         if: steps.check.outputs.has_update == 'true'
@@ -113,7 +126,10 @@ jobs:
         if: steps.check.outputs.has_update == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release create "v${VERSION}" dist/*.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --target main \
             --title "v${VERSION}" \
             --generate-notes
