@@ -25,13 +25,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
           ref: main
           fetch-depth: 0
 
       - name: Check upstream updates
         id: check
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           git config user.name "github-actions[bot]"
@@ -67,6 +68,8 @@ jobs:
       - name: Merge upstream & Tag version
         if: steps.check.outputs.has_update == 'true'
         id: versioning
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
         run: |
           NEW_COMMITS="${{ steps.check.outputs.new_commits }}"
           UPSTREAM_HASH="${{ steps.check.outputs.upstream_hash }}"
@@ -86,6 +89,7 @@ jobs:
           echo "Release Version: v$VERSION"
 
           git tag -f "v${VERSION}"
+          git remote set-url origin "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push origin main
           git push origin "v${VERSION}" --force
 
@@ -125,7 +129,7 @@ jobs:
       - name: Release to GitHub Releases
         if: steps.check.outputs.has_update == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           gh release create "v${VERSION}" dist/*.zip \
