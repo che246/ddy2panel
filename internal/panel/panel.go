@@ -102,6 +102,20 @@ type Panel struct {
 	started        time.Time
 	logs           *Ring
 
+	// 账号目录热重载（issue #199，见 reload.go）。
+	//   - reloadMu 同时保护下面几个字段与「一次重载的全程」：两次重载不并发，
+	//     面板读状态也不会读到半更新的结果。
+	//   - reloadMissing 是「连续几轮扫描都没见到」的缺席计数：删除要连续
+	//     reloadDeleteConfirm 次确认，避免半写文件/临时移走把账号踢掉。
+	//   - reloadFingerprint 是上次成功重载后的目录内容指纹，轮询据此跳过无变化的轮次。
+	reloadMu            sync.Mutex
+	reloadInterval      time.Duration
+	reloadDeleteConfirm int
+	reloadMissing       map[string]int
+	reloadFingerprint   string
+	reloadLastAt        time.Time
+	reloadLast          ReloadResult
+
 	// logins 进行中的 OAuth 设备授权会话（state → 会话信息）。
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
 	loginMu sync.Mutex
@@ -222,6 +236,9 @@ func New(cfg Config) *Panel {
 		started: time.Now(),
 		logs:    NewRing(500),
 		logins:  map[string]loginSession{},
+		// 热重载（issue #199）：默认 2 次连续缺席才删；间隔由 main 按 config 注入。
+		reloadDeleteConfirm: 2,
+		reloadMissing:       map[string]int{},
 	}
 	p.routes()
 	return p
@@ -235,6 +252,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/theme.js", p.themeScript)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.overview)
+	// 账号目录热重载（issue #199）：脚本/编排服务的确定性入口；后台轮询走同一实现。
+	p.mux.HandleFunc("POST /panel/api/accounts/reload", p.reloadAccounts)
 	p.proxyRoutes()
 	p.mux.HandleFunc("GET /panel/api/logs", p.logsHandler)
 	// 落盘日志按区间导出（zip）：事故复盘「把最近三天发我」不必 SSH 上去翻文件。
@@ -262,7 +281,6 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.accountResume)
 	// 账号分组标签（issue #159）：纯管理维度，落 state.json，供面板按组筛选与组内批量。
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/group", p.accountGroup)
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/scope", p.accountScope)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.accountCheckin)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.accountBalance)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.accountRemove)
@@ -296,6 +314,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/update", p.updateStatus)
 	p.mux.HandleFunc("POST /panel/api/update/check", p.checkUpdate)
 	p.mux.HandleFunc("POST /panel/api/update/install", p.installUpdate)
+	// 更新通道探测（issue #198）：分别探版本元数据与资产下载两条路。
+	p.mux.HandleFunc("POST /panel/api/update/probe", p.probeUpdate)
 }
 
 // publicPanelPaths 免鉴权的精确路径：静态页面与脚本本身不含秘密，其余一律要密钥。
@@ -387,7 +407,32 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。
 		"balance_refresh_sec":  p.balanceRefreshSec(),
 		"balance_refreshed_at": p.balanceRefreshedAt(),
+		// 账号目录热重载（issue #199）：面板显示「上次重载时间/结果摘要」。
+		"reload": p.reloadSnapshot(),
 	})
+}
+
+// reloadSnapshot 热重载状态（面板展示用）。无轮询时 interval_sec=0，前端据此
+// 标注「仅手动」。
+func (p *Panel) reloadSnapshot() map[string]any {
+	at, res := p.ReloadStatus()
+	p.reloadMu.Lock()
+	interval := p.reloadInterval
+	confirm := p.reloadDeleteConfirm
+	p.reloadMu.Unlock()
+	out := map[string]any{
+		"interval_sec":   int(interval.Seconds()),
+		"delete_confirm": confirm,
+	}
+	if !at.IsZero() {
+		out["at"] = at
+		out["added"] = res.Added
+		out["updated"] = res.Updated
+		out["removed"] = res.Removed
+		out["parse_errors"] = res.ParseErrors
+		out["skipped"] = res.Skipped
+	}
+	return out
 }
 
 // balanceRefreshSec 余额后台刷新间隔（秒）；无调度器/未开启时为 0。
@@ -1106,39 +1151,6 @@ func (p *Panel) accountGroup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "group": group})
 }
 
-// accountScope 设置账号的号池分区标签（body: {"scope":"text"|"media"}，空串 = 清除）。
-//
-// 与 group 的差别：group 纯管理维度，scope **参与选号**——pool.separate_text_media
-// 开启时它决定这个号能不能承接某类请求。所以这里校验取值而不是照单全收：
-// 写进一个不认识的字符串会被 NormalizeScope 悄悄归一成 text，运维以为标了媒体号、
-// 实际还是文本号，那是最难查的一类错配置。
-func (p *Panel) accountScope(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	var req struct {
-		Scope string `json:"scope"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-	switch req.Scope {
-	case "", pool.ScopeText, pool.ScopeMedia:
-	default:
-		writeErr(w, http.StatusBadRequest, "scope 只能是 \"text\" / \"media\" / 空")
-		return
-	}
-	if !p.cfg.Pool.SetScope(uid, req.Scope) {
-		writeErr(w, http.StatusNotFound, "account not found")
-		return
-	}
-	scope := pool.ScopeText
-	if st, ok := p.cfg.Pool.Status(uid); ok {
-		scope = st.Scope
-	}
-	log.Printf("panel: account scope uid=%s -> %s", uid, scope)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "scope": scope})
-}
-
 // accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
 // 与 scheduler.RunCheckinNow 的单号语义一致。
 func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
@@ -1245,6 +1257,12 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 	p.proxyAccountMu.Lock()
 	defer p.proxyAccountMu.Unlock()
+	// 与目录热重载串行化（issue #199 风险 3）：重载正在对齐池时插入一次移除，
+	// 可能出现「重载刚按扫描结果 upsert 回来、这边又删掉」的交错，两边都以为
+	// 自己是对的。锁序固定为 proxyAccountMu → reloadMu → pool.mu：全仓只有本函数
+	// 同时持有前两个（proxies.go 那两处只取 proxyAccountMu），不存在反向路径。
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
 	uid := r.PathValue("uid")
 	if p.cfg.Pool.AuthByUID(uid) == nil {
 		writeErr(w, http.StatusNotFound, "account not found")

@@ -760,6 +760,74 @@ function renderUpdateStatus(update) {
   $('btnUpdateInstall').disabled = updateBusy || !!update.installing;
   $('btnUpdateRelease').hidden = (!update.update_available && !unknown) || !!update.can_install || !update.release_url;
   $('btnUpdateCheck').disabled = updateBusy || !!update.installing;
+  renderUpdateChannel(update);
+}
+
+// renderUpdateChannel 展示「更新走哪条通道」与上次失败的归因（issue #198）。
+//
+// 现场痛点：api.github.com 通、release-assets 被拦时，面板只显示一句原始超时文本，
+// 用户既不知道自己有没有走代理，也不知道下一步该配什么。这里把通道名与类目直接
+// 摆出来，并把类目翻成一句人话建议。
+const UPDATE_CHANNEL_LABEL = {
+  'direct': '直连（已关闭环境变量代理）',
+  'direct(env)': '直连（跟随环境变量）',
+  'proxy': '代理',
+  'mirror': '镜像',
+  'mirror+proxy': '镜像 + 代理',
+};
+const UPDATE_ERROR_ADVICE = {
+  'dns': '域名解析失败：检查容器 DNS（可用 dns_servers）与出站策略。',
+  'connect': 'TCP 连不上：出站被拦或网络不可达；可配「更新代理」或「镜像前缀」绕行。',
+  'tls': 'TLS 握手/证书失败：常见于中间设备劫持或系统 CA 过期；先试镜像。',
+  'header-timeout': '等响应头超时：出站到 release-assets 很可能被拦（api.github.com 往往仍通）；配代理或镜像即可。',
+  'body-stall': '下载中途停滞：链路抖动或镜像限速；换镜像或配代理。',
+  'checksum': '摘要/尺寸不符：下载内容被中间层改写；换回直连或换可信镜像（不要放宽校验）。',
+  'http': '对方返回非 200：镜像不可用或前缀路径不对；检查镜像前缀。',
+  'proxy-config': '代理地址不合法；只支持 http、https、socks5 三种协议。',
+  'mirror-config': '镜像前缀不合法；需要 http 或 https 加主机名加斜杠的形式。',
+};
+function renderUpdateChannel(update) {
+  const el = $('updateChannel');
+  if (!el) return;
+  const bits = ['通道：' + (UPDATE_CHANNEL_LABEL[update.channel] || update.channel || '未知')];
+  if (update.proxy_host) bits.push('代理 ' + update.proxy_host);
+  if (update.mirror) bits.push('镜像 ' + update.mirror);
+  el.textContent = bits.join(' · ');
+  const advice = UPDATE_ERROR_ADVICE[update.last_error_kind];
+  if (advice) {
+    el.textContent += ' ｜ 上次失败[' + update.last_error_kind + ']：' + advice;
+    el.style.color = 'var(--warn)';
+  } else {
+    el.style.color = '';
+  }
+}
+
+// 测试连通性：分别探「版本元数据」与「资产下载」两条路，把结果逐行摆出来。
+// 检查更新只回答「有没有新版本」，通道坏的时候它给不出「坏在哪一段」。
+async function probeUpdateChannel() {
+  const button = $('btnUpdateProbe');
+  const out = $('updateProbeOut');
+  button.disabled = true;
+  button.textContent = '探测中…';
+  out.hidden = false;
+  out.textContent = '正在探测…';
+  try {
+    const r = await api('update/probe', { method: 'POST' });
+    const rows = [r.meta, r.asset].filter(Boolean).map(p => {
+      const state = p.ok ? '通' : ('失败[' + (p.kind || 'unknown') + ']');
+      const extra = p.ok ? ('HTTP ' + p.status) : (p.error || '');
+      return p.target + '：' + state + ' · ' + p.elapsed_ms + 'ms · ' + extra;
+    });
+    out.innerHTML = rows.map(t => '<div>' + esc(t) + '</div>').join('');
+    const advice = UPDATE_ERROR_ADVICE[(r.meta && r.meta.kind) || (r.asset && r.asset.kind)];
+    if (advice) out.innerHTML += '<div style="color:var(--warn)">' + esc(advice) + '</div>';
+    if (r.update) renderUpdateStatus(r.update);
+  } catch (e) {
+    out.textContent = '探测失败：' + e.message;
+  } finally {
+    button.disabled = false;
+    button.textContent = '测试连通性';
+  }
 }
 
 async function checkForUpdates() {
@@ -810,6 +878,7 @@ function openLatestRelease() {
 }
 
 if ($('btnUpdateCheck')) $('btnUpdateCheck').onclick = checkForUpdates;
+if ($('btnUpdateProbe')) $('btnUpdateProbe').onclick = probeUpdateChannel;
 if ($('btnUpdateInstall')) $('btnUpdateInstall').onclick = installUpdate;
 if ($('btnUpdateRelease')) $('btnUpdateRelease').onclick = openLatestRelease;
 if ($('navUpdate')) $('navUpdate').onclick = () => {
@@ -1826,6 +1895,8 @@ const CFG_MAP = {
   listen: ['listen'], api_key: ['api_key'],
   package_detail_limit: ['panel', 'package_detail_limit'],
   update_auto_enabled: ['update', 'auto_enabled'], update_auto_time: ['update', 'auto_time'],
+  update_proxy: ['update', 'proxy'], update_mirror: ['update', 'mirror'],
+  update_proxy_from_env: ['update', 'proxy_from_env'],
   poll_interval_sec: ['panel', 'poll_interval_sec'],
   checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'], growth_hours: ['schedule', 'growth_hours'], growth_enabled: ['schedule', 'growth_enabled'],
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
@@ -4426,10 +4497,10 @@ function remarkFormRows() {
   // key = uid 前 8 位（备注映射的键）；uid 保留全值，分组要打真接口按完整 uid 走；
   // inPool=false 的行是「账号已不在池里、但本机还留着备注」的孤儿，只能改备注。
   const rows = ((overviewData && overviewData.accounts) || [])
-    .map(s => ({ key: remarkKey(s.uid), uid: s.uid, who: s.nickname || remarkKey(s.uid), group: s.group || '', scope: s.pool_scope || 'text', inPool: true }))
+    .map(s => ({ key: remarkKey(s.uid), uid: s.uid, who: s.nickname || remarkKey(s.uid), group: s.group || '', inPool: true }))
     .filter(r => r.key);
   for (const k of Object.keys(remarksAll())) {
-    if (!rows.some(r => r.key === k)) rows.push({ key: k, uid: '', who: k, group: '', scope: 'text', inPool: false });
+    if (!rows.some(r => r.key === k)) rows.push({ key: k, uid: '', who: k, group: '', inPool: false });
   }
   return rows;
 }
@@ -4437,9 +4508,6 @@ function remarkFormRows() {
 /* 分组编辑的原始值（保存时只提交真正改动过的行，避免「保存备注」顺手把几十个账号
    的分组各打一次接口）。 */
 let remarkGroupOrig = {};
-/* 号池标注的原始值。与 group 分开记：两者是不同接口、不同语义（scope 参与选号，
-   group 纯管理），改动互不影响，混在一个 map 里会让「只改了号池」也去提交分组。 */
-let remarkScopeOrig = {};
 /* onlyUID 非空时只渲染该账号一行（账号池行内「备注」按钮走这条），避免为改一个号
    在几十行里翻找。 */
 function renderRemarkBody(onlyUID) {
@@ -4451,16 +4519,12 @@ function renderRemarkBody(onlyUID) {
     rows = rows.filter(r => r.key === k);
   }
   remarkGroupOrig = {};
-  remarkScopeOrig = {};
-  rows.forEach(r => { if (r.inPool) { remarkGroupOrig[r.uid] = r.group; remarkScopeOrig[r.uid] = r.scope; } });
+  rows.forEach(r => { if (r.inPool) remarkGroupOrig[r.uid] = r.group; });
   box.innerHTML = rows.length
     ? rows.map(r => '<div class="rm-row"><span class="rm-who" title="' + esc(r.who) + '">' + esc(r.who) + '</span>' +
         '<input type="text" data-uid="' + esc(r.key) + '" value="' + esc(remarksAll()[r.key] || '') + '" placeholder="备注（留空即清除）" maxlength="24">' +
         (r.inPool
-          ? '<input type="text" data-guid="' + esc(r.uid) + '" value="' + esc(r.group) + '" placeholder="分组（留空即未分组）" maxlength="24">' +
-            '<select data-suid="' + esc(r.uid) + '" title="号池分区：开启 pool.separate_text_media 后文本对话只选 text 号、图片/视频只选 media 号">' +
-            ['text', 'media'].map(v => '<option value="' + v + '"' + (r.scope === v ? ' selected' : '') + '>' +
-              (v === 'media' ? '媒体号池' : '文本号池') + '</option>').join('') + '</select>'
+          ? '<input type="text" data-guid="' + esc(r.uid) + '" value="' + esc(r.group) + '" placeholder="分组（留空即未分组）" maxlength="24">'
           : '<input type="text" value="（账号已不在池里）" disabled>') +
         '</div>').join('')
     : '<div class="empty">暂无账号：先在「账号池」加载一次账号列表。</div>';
@@ -4485,12 +4549,6 @@ async function saveRemarkForm() {
     const uid = inp.getAttribute('data-guid'), v = inp.value.trim();
     if ((remarkGroupOrig[uid] || '') !== v) changed.push([uid, v]);
   });
-  // 号池标注（服务端字段，参与选号）：同样只提交改动过的行。
-  const scopeChanged = [];
-  document.querySelectorAll('#remarkBody select[data-suid]').forEach(sel => {
-    const uid = sel.getAttribute('data-suid'), v = sel.value;
-    if ((remarkScopeOrig[uid] || 'text') !== v) scopeChanged.push([uid, v]);
-  });
   closeRemarks();
   let ok = 0;
   const bad = [];
@@ -4498,20 +4556,12 @@ async function saveRemarkForm() {
     try { await api('accounts/' + encodeURIComponent(uid) + '/group', { method: 'POST', body: JSON.stringify({ group }) }); ok++; }
     catch (e) { bad.push(uid.slice(0, 8) + '：' + e.message); }
   }
-  let scopeOk = 0;
-  for (const [uid, scope] of scopeChanged) {
-    try { await api('accounts/' + encodeURIComponent(uid) + '/scope', { method: 'POST', body: JSON.stringify({ scope }) }); scopeOk++; }
-    catch (e) { bad.push(uid.slice(0, 8) + '：' + e.message); }
-  }
   if (view === 'accounts') loadOverview(true);
   else if (view === 'usage' && usageData) renderUsage(usageData);
-  if (changed.length || scopeChanged.length) {
-    const parts = [];
-    if (changed.length) parts.push('分组已更新 ' + ok + ' 个');
-    if (scopeChanged.length) parts.push('号池已更新 ' + scopeOk + ' 个');
+  if (changed.length) {
     const head = bad.length
-      ? parts.join('、') + '，失败 ' + bad.length + ' 个（' + bad[0] + '）'
-      : parts.join('、');
+      ? '分组已更新 ' + ok + ' 个，失败 ' + bad.length + ' 个（' + bad[0] + '）'
+      : '分组已更新 ' + ok + ' 个';
     toast(head + (saved ? '' : '；备注未能写入浏览器存储（隐私模式或空间已满），刷新后会丢失'), bad.length || !saved ? 'err' : 'ok');
   } else {
     toast(saved ? '备注已保存（仅本机浏览器）' : '备注未能写入浏览器存储（隐私模式或空间已满），刷新后会丢失', saved ? '' : 'err');
@@ -5682,16 +5732,10 @@ $('proxyImport').onclick = async () => {
   try {
     const data = await api('proxies', { method: 'POST', body: JSON.stringify({ lines }) });
     const rows = data.results || [];
-    // unsupported 单列：那些是「认得出来、但本网关传输层不解析」的协议（ss/vmess/
-    // trojan…）。既不该算作无效（用户没写错），也不该回填输入框（整段订阅回填没
-    // 意义），只把原因说清楚。
-    const skipped = rows.filter(r => r.status === 'unsupported');
-    $('proxyImportResults').textContent = '添加 ' + rows.filter(r => r.status === 'added').length + ' 个 · 重复 ' + rows.filter(r => r.status === 'duplicate').length +
-      ' 个 · 不支持 ' + skipped.length + ' 个 · 无效 ' + rows.filter(r => r.status === 'invalid').length + ' 个' +
-      skipped.map(r => '\n' + (r.name || ('第 ' + r.line + ' 行')) + '：' + r.error).join('') +
+    $('proxyImportResults').textContent = '添加 ' + rows.filter(r => r.status === 'added').length + ' 个 · 重复 ' + rows.filter(r => r.status === 'duplicate').length + ' 个 · 无效 ' + rows.filter(r => r.status === 'invalid').length + ' 个' +
       rows.filter(r => r.status === 'invalid').map(r => '\n第 ' + r.line + ' 行：' + r.error).join('');
     const inputLines = lines.split('\n');
-    $('proxyLines').value = rows.filter(r => r.status === 'invalid').map(r => inputLines[r.line - 1] || '').join('\n');
+    $('proxyLines').value = rows.filter(r => r.status === 'invalid').map(r => inputLines[r.line - 1]).join('\n');
     await loadProxies();
   } catch (e) { toast('添加失败：' + e.message, 'err'); }
   finally { button.disabled = false; }

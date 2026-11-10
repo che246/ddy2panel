@@ -45,9 +45,6 @@ type Pool struct {
 	// 让新一轮窗口从重置那一刻起算。**持久化**——进程内冷却表是易失的，窗口记录
 	// 跟着丢就等于每次重启都错过重置时刻，正是本机制要治的那段空转。
 	windows map[string]*ModelWindow
-	// scopeEnforced 号池分区是否强制（scope.go，pool.separate_text_media）。关闭时
-	// pick 不做池过滤、CheckScope 恒放行——分区前的行为逐字不变。
-	scopeEnforced bool
 	// degradeThreshold / degradeCooldown / degradeCooldownMax 连败降权参数
 	// （SetDegrade 注入；默认值见 defaultDegrade*，issue #114）。
 	degradeThreshold   int
@@ -519,6 +516,45 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	if changed && !p.saveLocked() {
 		p.dirty.Store(true) // 剔除结果没落盘：交给 flusher 重试，否则已删账号下次启动复活
 	}
+}
+
+// InFlight 返回某账号当前在途请求数（不存在/已删除返回 0）。
+//
+// 热重载剔除账号前用它做一次「真的没人用」检查：把在途请求的账号从池里拿掉，
+// 那条请求收尾时 Release 会对已删条目变成 no-op，计费/日志都还算得上，但面板上
+// 会出现「账号消失时还有流量」。宁可下一轮扫描再删。
+func (p *Pool) InFlight(uid string) int64 {
+	p.mu.RLock()
+	e, ok := p.byUID[uid]
+	p.mu.RUnlock()
+	if !ok {
+		return 0
+	}
+	return e.inFlight.Load()
+}
+
+// RemoveMany 批量剔除账号并只落盘一次；返回实际剔除的 uid。热重载用。
+//
+// 与逐个 Remove 的差别：一次 saveLocked，避免 N 个账号批量消失时写 N 次 state.json。
+// 不在池里的 uid 静默忽略（并发下另一个调用可能已经删过）。
+func (p *Pool) RemoveMany(uids []string) []string {
+	if len(uids) == 0 {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var removed []string
+	for _, uid := range uids {
+		if _, ok := p.byUID[uid]; !ok {
+			continue
+		}
+		delete(p.byUID, uid)
+		removed = append(removed, uid)
+	}
+	if len(removed) > 0 && !p.saveLocked() {
+		p.dirty.Store(true)
+	}
+	return removed
 }
 
 // Remove 从池中移除账号并立即落盘（管理面板用）。返回被移除账号的凭证

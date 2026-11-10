@@ -162,8 +162,6 @@ func main() {
 	p.SetAccountShare(cfg.Pool.AccountShare)
 	// 选号策略（pool.selection_strategy）：weighted 缺省 / round_robin / sequential。
 	p.SetStrategy(cfg.Pool.SelectionStrategy)
-	// 号池分区（pool.scope.go）：文本 / 媒体各自选号。缺省关，开了才过滤。
-	p.SetScopeEnforced(cfg.Pool.SeparateTextMedia)
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -369,9 +367,6 @@ func main() {
 	case cfg.TaskSweepInterval > 0:
 		log.Printf("补领清扫：每 %s（只 accept 待接受的、只 claim 已达标未领的）", cfg.TaskSweepInterval)
 	}
-	if cfg.Pool.SeparateTextMedia {
-		log.Printf("号池分区已开启：文本对话只选 text 号、图片/视频只选 media 号（pool.separate_text_media）")
-	}
 	if !cfg.Schedule.WindowProbeEnabled {
 		log.Printf("额度窗口探针已禁用（schedule.window_probe_enabled=false）")
 	}
@@ -446,10 +441,7 @@ func main() {
 	up.SetCreditObserver(creditHist.Observe)
 	log.Printf("[credithist] 积分历史已启用: %s", stateSibling(cfg.StateFile, "credit-history.json"))
 
-	updateManager := updater.New(appVersion, appRepository, *cfgPath, updater.Settings{
-		AutoEnabled: cfg.Update.AutoEnabled,
-		AutoTime:    cfg.Update.AutoTime,
-	})
+	updateManager := updater.New(appVersion, appRepository, *cfgPath, updateSettingsFrom(cfg))
 	var pn *panel.Panel
 	pn = panel.New(panel.Config{
 		Pool:       p,
@@ -487,10 +479,7 @@ func main() {
 				return nil, err
 			}
 			if saved, loadErr := Load(*cfgPath); loadErr == nil {
-				updateManager.Configure(updater.Settings{
-					AutoEnabled: saved.Update.AutoEnabled,
-					AutoTime:    saved.Update.AutoTime,
-				})
+				updateManager.Configure(updateSettingsFrom(saved))
 			} else if loadErr != nil {
 				log.Printf("WARN: reload update settings: %v", loadErr)
 			}
@@ -594,6 +583,11 @@ func main() {
 	defer func() { stopProxies(); <-proxyDone }()
 	updateManager.SetRestart(stop)
 	go updateManager.Run(ctx)
+	// 账号目录热重载（issue #199）：外部同步进来的 auths/*.json 不必重启进程即可入池，
+	// 删文件也会在连续 N 次扫描确认后出池。面板「刷新」按钮之外还提供
+	// POST /panel/api/accounts/reload 给脚本用；间隔 0s 时只保留手动接口。
+	pn.SetReloadConfig(cfg.ReloadIntervalDur, cfg.Accounts.ReloadDeleteConfirm)
+	go pn.ReloadLoop(ctx.Done())
 	// 账号后台任务（taskjobs）：状态与主 state 同目录，重启后自动恢复未完成作业。
 	if err := pn.StartTaskJobs(ctx, stateSibling(cfg.StateFile, "task-jobs.json")); err != nil {
 		p.Flush() // Fatal 绕过 defer：至少把池状态落盘再退
@@ -839,6 +833,28 @@ func effortPolicyOf(cfg *Config) *upstream.EffortPolicy {
 	}
 }
 
+// updateSettingsFrom 把 config 的 update 段翻成 updater.Settings（issue #198）。
+//
+// 单独抽成函数是因为「启动装配」与「配置保存后热更新」两处必须用同一口 IO——
+// 各写一份字面量时，新增字段必然只接一处（热更新丢了 proxy/mirror，面板看着
+// 保存成功、实际还是旧通道）。
+//
+// proxy_from_env 在 config 里是 *bool：JSON 缺键 = 未表态 → 沿用环境变量（历史
+// 行为，也是绝大多数部署的实际形态）；显式 false 才完全不读环境。
+func updateSettingsFrom(u *Config) updater.Settings {
+	fromEnv := true
+	if u.Update.ProxyFromEnv != nil {
+		fromEnv = *u.Update.ProxyFromEnv
+	}
+	return updater.Settings{
+		AutoEnabled:  u.Update.AutoEnabled,
+		AutoTime:     u.Update.AutoTime,
+		Proxy:        u.Update.Proxy,
+		ProxyFromEnv: fromEnv,
+		Mirror:       u.Update.Mirror,
+	}
+}
+
 func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, gw *server.Handler, pn *panel.Panel, running ...*Config) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
@@ -952,8 +968,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetReserveCreditsByRealm(newCfg.Pool.ReserveCreditsByRealm) // 按域覆盖热生效（issue #147）
 	p.SetAccountPriority(newCfg.Pool.AccountPriority)             // 账号优先级/占比热生效（issue #62）
 	p.SetAccountShare(newCfg.Pool.AccountShare)
-	p.SetStrategy(newCfg.Pool.SelectionStrategy)      // 选号策略热生效
-	p.SetScopeEnforced(newCfg.Pool.SeparateTextMedia) // 号池分区热生效
+	p.SetStrategy(newCfg.Pool.SelectionStrategy) // 选号策略热生效
 	sch.Reconfigure(scheduler.ScheduleParams{
 		CheckinHours:   newCfg.Schedule.CheckinHours,
 		TravelHours:    newCfg.Schedule.TravelHours,

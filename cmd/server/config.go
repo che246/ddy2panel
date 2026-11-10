@@ -44,7 +44,33 @@ type Config struct {
 		AutoEnabled bool `json:"auto_enabled"`
 		// AutoTime 自动更新时间，格式 HH:MM（Asia/Shanghai）。
 		AutoTime string `json:"auto_time"`
+		// Proxy 更新走哪个出口（issue #198，可热生效）：空 = 不显式设置；
+		// 支持 http:// / https:// / socks5://。出站被墙、api.github.com 通而
+		// release-assets 不通时填这里（或 mirror）。
+		Proxy string `json:"proxy"`
+		// ProxyFromEnv 是否沿用进程环境变量里的 HTTP(S)_PROXY（默认 true）。
+		// 设为 false 时只看 proxy 字段——容器里环境变量被别处塞了值、但更新
+		// 需要走另一条通道时用。
+		ProxyFromEnv *bool `json:"proxy_from_env"`
+		// Mirror 资产下载镜像前缀（issue #198），例如 https://ghfast.top/。
+		// 只作用于**资产下载**：Release 元数据（tag/digest/size）永远直连
+		// api.github.com，校验口径不变，镜像无法投毒。空 = 直连。
+		Mirror string `json:"mirror"`
 	} `json:"update"`
+
+	Accounts struct {
+		// ReloadInterval 账号目录热重载轮询间隔（issue #199）。空 = 默认 10s；
+		// "0s" = 关闭轮询（手动接口 POST /panel/api/accounts/reload 仍然可用）。
+		//
+		// 为什么默认开启：外部脚本/另一台机器往 auths/ 同步文件是最常见用法，
+		// 而重启进程会丢在途请求。轮询只读 ReadDir + 少量解析，几十个号的目录
+		// 是微秒级开销。
+		ReloadInterval string `json:"reload_interval"`
+		// ReloadDeleteConfirm 文件消失后要连续几轮扫描确认才把账号移出池（默认 2）。
+		// 半写文件、临时移走文件都可能让账号「这一轮看不见」；剔除会写进 state.json，
+		// 下次启动也不复活，所以要连续确认。1 = 立即删（不建议）。
+		ReloadDeleteConfirm int `json:"reload_delete_confirm"`
+	} `json:"accounts"`
 
 	Logging struct {
 		// RequestArchiveEnabled 请求元数据 JSONL 归档开关，缺省 true。
@@ -399,17 +425,7 @@ type Config struct {
 		// 在途上限、积分保底、成本分层、账号优先级全部先于它生效。所以切到
 		// sequential 也烧不穿 credit_floor——这是有意的边界，不是实现疏忽。
 		// 热生效（面板保存配置即换），无需重启。
-		SelectionStrategy string `json:"selection_strategy"`
-		// SeparateTextMedia 号池分区（pool 包 scope.go）：文本对话与图片/视频生成
-		// 各自从自己的号池里选号。缺省 false = 分区前的行为逐字不变。
-		//
-		// 为什么值得开：两类请求在上游是两套风控口径，同一个号既对话又画图时，画图
-		// 侧被判异常会连坐文本侧。分区后互不污染。代价是两边的可用号都变少——号不多
-		// 的部署开了可能反而更容易 503，所以缺省关。
-		//
-		// 打开后**必须**给要画图的号单独标 media（面板账号行「号池」下拉）：未标注的
-		// 号一律按文本号处理（保守缺省，避免老部署升级当天画图全 403）。
-		SeparateTextMedia bool    `json:"separate_text_media"`
+		SelectionStrategy string  `json:"selection_strategy"`
 		IdleWeightPerHour float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax     float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
 		// PreferExpiring 快过期积分加权开关，默认 true。开启且 expiring_soon 窗口内
@@ -541,6 +557,8 @@ type Config struct {
 	ServerReadTimeoutDur time.Duration `json:"-"`
 	// ShutdownTimeoutDur 解析后的优雅关停窗口；0 = 不等待在途请求直接退。
 	ShutdownTimeoutDur time.Duration `json:"-"`
+	// ReloadIntervalDur 解析后的账号目录轮询间隔（issue #199）；0 = 关闭轮询。
+	ReloadIntervalDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -561,6 +579,9 @@ func Default() *Config {
 	c.Upstream.RestrictionHoldSeconds = 1800
 	c.Panel.PackageDetailLimit = 5
 	c.Update.AutoTime = "04:00"
+	// 账号目录热重载（issue #199）：默认 10s 轮询、连续 2 次确认才删。
+	c.Accounts.ReloadInterval = "10s"
+	c.Accounts.ReloadDeleteConfirm = 2
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
 	c.Logging.RequestArchiveMaxMB = 100
@@ -589,9 +610,6 @@ func Default() *Config {
 	c.Schedule.TaskSweepEnabled = true
 	c.Schedule.TaskSweepMinutes = 15
 	c.Schedule.WindowProbeEnabled = true
-	// 号池分区缺省关闭：显式写出来是为了让「默认值」在 Default() 里可读，
-	// 而不是靠调用者去猜 bool 零值。
-	c.Pool.SeparateTextMedia = false
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -1070,6 +1088,20 @@ func (c *Config) normalize() error {
 	}
 	if c.CostExploreIntervalDur < 0 {
 		c.CostExploreIntervalDur = 0
+	}
+	// 账号目录热重载轮询（issue #199）。空值回落默认 10s；"0s" 是合法值（关闭），
+	// 负值钳 0 同关闭（"-5s" 无合理语义）。
+	if c.Accounts.ReloadInterval == "" {
+		c.Accounts.ReloadInterval = "10s"
+	}
+	if c.ReloadIntervalDur, err = time.ParseDuration(c.Accounts.ReloadInterval); err != nil {
+		return fmt.Errorf("accounts.reload_interval: %w", err)
+	}
+	if c.ReloadIntervalDur < 0 {
+		c.ReloadIntervalDur = 0
+	}
+	if c.Accounts.ReloadDeleteConfirm <= 0 {
+		c.Accounts.ReloadDeleteConfirm = 2
 	}
 	// 窗口用量调度窗口（issue #112）：空值回落默认 1h；"0" 合法（关停）；负值钳 0。
 	if c.Pool.BalanceWindow == "" {
